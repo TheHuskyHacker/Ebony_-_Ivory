@@ -71,6 +71,7 @@ sudo python3 ebony_ivory.py -t 192.168.1.50 -p 22,80,443,8080-8090 -up 53,161,50
 | `--show-closed` | Show closed/filtered ports in output | off |
 | `--skip-ping` | Skip host discovery, scan directly | off |
 | `--export FILE` | Export results to JSON | — |
+| `-Pn` | Ping Flag | - | 
 
 ---
 
