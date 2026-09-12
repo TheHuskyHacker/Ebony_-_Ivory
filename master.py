@@ -401,8 +401,8 @@ def parse_args():
                    help="Attempt service banner grabbing on open TCP ports")
     p.add_argument("--show-closed", action="store_true",
                    help="Show closed/filtered ports in output")
-    p.add_argument("--skip-ping", action="store_true",
-                   help="Skip host discovery, scan target directly")
+    p.add_argument("-Pn", "--skip-ping", action="store_true",
+                   help="Skip host discovery, scan target directly (nmap-style)")
     p.add_argument("--export", metavar="FILE",
                    help="Export results to JSON file")
     return p.parse_args()
@@ -426,7 +426,7 @@ def main():
         if not target_hosts:
             print(f"\n  {red('[-]')} No live hosts answered. The demons are hiding.")
             if not args.skip_ping:
-                print(f"  {dim('    Try --skip-ping to scan anyway')}")
+                print(f"  {dim('    Try -Pn to scan anyway')}")
                 sys.exit(0)
     else:
         if args.skip_ping:
@@ -442,7 +442,7 @@ def main():
                 host_ttls[target_input] = ttl
             else:
                 print(f"    {red('[-]')} Target did not respond to ICMP or TCP probes")
-                print(f"    {dim('    Try --skip-ping to force the scan')}")
+                print(f"    {dim('    Try -Pn to force the scan')}")
                 sys.exit(0)
 
     if not target_hosts:
