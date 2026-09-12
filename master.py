@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Shut up Scapy's startup noise
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
-from scapy.all import IP, TCP, UDP, ICMP, sr1, send, conf
+from scapy.all import IP, TCP, UDP, ICMP, sr, sr1, send, conf
 
 # Suppress Scapy's own send/recv chatter
 conf.verb = 0
@@ -29,8 +29,8 @@ conf.verb = 0
 
 DEFAULT_TCP_PORTS = [
     21, 22, 23, 25, 53, 80, 88, 110, 111, 135, 139, 143,
-    443, 445, 389, 636, 993, 995, 1433, 1521, 2049, 3306,
-    3389, 5432, 5900, 5985, 5986, 6379, 8080, 8443, 8888, 9090,
+    443, 445, 389, 636, 993, 995, 1433, 1521, 2049, 2222,
+    3306, 3389, 5432, 5900, 5985, 5986, 6379, 8080, 8443, 8888, 9090,
 ]
 
 DEFAULT_UDP_PORTS = [
@@ -47,7 +47,7 @@ SERVICE_MAP = {
     162: "SNMP-Trap", 389: "LDAP", 443: "HTTPS", 445: "SMB",
     500: "IKE", 514: "Syslog", 636: "LDAPS", 993: "IMAPS",
     995: "POP3S", 1433: "MSSQL", 1521: "Oracle", 1900: "SSDP/UPnP",
-    2049: "NFS", 3306: "MySQL", 3389: "RDP", 4500: "IPSec-NAT",
+    2049: "NFS", 2222: "SSH-Alt", 3306: "MySQL", 3389: "RDP", 4500: "IPSec-NAT",
     5353: "mDNS", 5432: "PostgreSQL", 5900: "VNC", 5985: "WinRM",
     5986: "WinRM-S", 6379: "Redis", 8080: "HTTP-Alt", 8443: "HTTPS-Alt",
     8888: "HTTP-Alt2", 9090: "Prometheus",
@@ -263,18 +263,59 @@ def ping_sweep(subnet, timeout=0.8, workers=10):
 
 # ────────────────── scanning ──────────────────────────────
 
-def ivory_tcp_scan(target, port, timeout=1.0):
-    """Ivory: TCP SYN half-open scan — fires a single shot and reads the flags."""
+def ivory_tcp_batch(target, ports, timeout=2.0, banners=False):
+    """Ivory: batch TCP SYN scan using sr() — sends all SYNs at once and
+    matches responses properly. This is how the pros do it."""
+    # Build all SYN packets
+    pkts = IP(dst=target) / TCP(dport=ports, flags="S")
+
+    # sr() sends all packets and collects matched responses
+    answered, unanswered = sr(pkts, timeout=timeout, verbose=False)
+
+    results = {}
+
+    # Process answered packets
+    for sent, recv in answered:
+        port = sent[TCP].dport
+        if recv.haslayer(TCP):
+            flags = recv[TCP].flags
+            if flags == 0x12:  # SYN-ACK → open
+                # Fire RST to clean up the half-open connection
+                send(IP(dst=target) / TCP(dport=port, flags="R"), verbose=False)
+                banner = None
+                if banners:
+                    banner = grab_banner(target, port, timeout=2.0)
+                results[port] = ("OPEN", banner)
+            elif flags & 0x04:  # RST → closed
+                results[port] = ("CLOSED", None)
+            else:
+                results[port] = ("FILTERED", None)
+        elif recv.haslayer(ICMP):
+            results[port] = ("FILTERED", None)
+        else:
+            results[port] = ("FILTERED", None)
+
+    # Unanswered = filtered (no response at all)
+    for sent in unanswered:
+        port = sent[TCP].dport
+        if port not in results:
+            results[port] = ("FILTERED", None)
+
+    # Return sorted list
+    return [(p, results[p][0], results[p][1]) for p in sorted(results)]
+
+
+def ivory_tcp_single(target, port, timeout=2.0):
+    """Ivory: single-port TCP SYN scan fallback using sr1()."""
     syn = IP(dst=target) / TCP(dport=port, flags="S")
     resp = sr1(syn, timeout=timeout, verbose=False)
 
     if resp and resp.haslayer(TCP):
         flags = resp.getlayer(TCP).flags
         if flags == 0x12:  # SYN-ACK → open
-            # Send RST to tear down (use send(), no response expected)
             send(IP(dst=target) / TCP(dport=port, flags="R"), verbose=False)
             return "OPEN"
-        elif flags == 0x14:  # RST-ACK → closed
+        elif flags & 0x04:  # RST → closed
             return "CLOSED"
     return "FILTERED"
 
@@ -297,27 +338,17 @@ def ebony_udp_scan(target, port, timeout=2.0):
     return "UNKNOWN"
 
 
-def scan_ports(target, ports, scan_func, protocol, workers=1, timeout=1.0, banners=False):
-    """Run a scan function across a port list, optionally with threading (TCP only)."""
+def scan_tcp(target, ports, timeout=2.0, banners=False):
+    """Run TCP scan using batch mode for speed and reliability."""
+    return ivory_tcp_batch(target, ports, timeout=timeout, banners=banners)
+
+
+def scan_udp(target, ports, timeout=2.0):
+    """Run UDP scan sequentially (UDP needs patience)."""
     results = []
-
-    def do_scan(port):
-        state = scan_func(target, port, timeout)
-        banner = None
-        if banners and state == "OPEN" and protocol == "TCP":
-            banner = grab_banner(target, port, timeout=2.0)
-        return port, state, banner
-
-    if workers > 1 and protocol == "TCP":
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(do_scan, p): p for p in ports}
-            for future in as_completed(futures):
-                results.append(future.result())
-    else:
-        for port in ports:
-            results.append(do_scan(port))
-
-    # Sort by port number
+    for port in ports:
+        state = ebony_udp_scan(target, port, timeout)
+        results.append((port, state, None))
     results.sort(key=lambda r: r[0])
     return results
 
@@ -395,8 +426,8 @@ def parse_args():
                    help="UDP ports: same format as -p (default: curated list)")
     p.add_argument("--threads", type=int, default=10,
                    help="Parallel threads for TCP scans (default: 10)")
-    p.add_argument("--timeout", type=float, default=1.0,
-                   help="Per-port timeout in seconds (default: 1.0)")
+    p.add_argument("--timeout", type=float, default=2.0,
+                   help="Per-probe timeout in seconds (default: 2.0)")
     p.add_argument("--banners", action="store_true",
                    help="Attempt service banner grabbing on open TCP ports")
     p.add_argument("--show-closed", action="store_true",
@@ -470,9 +501,9 @@ def main():
         # ── Ivory (TCP) ──
         if args.mode in ("ivory", "both"):
             print(f"\n  {bold(cyan('[Ivory]'))} Firing TCP SYN shots...")
-            tcp_results = scan_ports(
-                target, tcp_ports, ivory_tcp_scan, "TCP",
-                workers=args.threads, timeout=args.timeout,
+            tcp_results = scan_tcp(
+                target, tcp_ports,
+                timeout=max(args.timeout, 2.0),
                 banners=args.banners,
             )
             tcp_open = print_scan_results(tcp_results, "TCP", show_closed=args.show_closed)
@@ -485,9 +516,9 @@ def main():
         # ── Ebony (UDP) ──
         if args.mode in ("ebony", "both"):
             print(f"\n  {bold(magenta('[Ebony]'))} Firing UDP probe shots...")
-            udp_results = scan_ports(
-                target, udp_ports, ebony_udp_scan, "UDP",
-                workers=1, timeout=max(args.timeout, 2.0),
+            udp_results = scan_udp(
+                target, udp_ports,
+                timeout=max(args.timeout, 2.0),
             )
             udp_open = print_scan_results(udp_results, "UDP", show_closed=args.show_closed)
             total_open += udp_open
